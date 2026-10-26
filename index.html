@@ -50,11 +50,15 @@
       -webkit-tap-highlight-color: transparent;
     }
 
+    html, body {
+      width: 100%;
+      min-height: 100%;
+    }
+
     body {
       font-family: 'Plus Jakarta Sans', 'Noto Sans TC', system-ui, -apple-system, sans-serif;
       background: var(--bg-gradient);
       color: var(--text-main);
-      min-height: 100vh;
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -119,6 +123,26 @@
       display: flex;
       align-items: center;
       gap: 8px;
+    }
+
+    .pronunciation-count-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: var(--badge-bg);
+      color: var(--badge-text);
+      border: 1px solid var(--card-border);
+      font-size: 0.82rem;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .pronunciation-count-badge b { font-size: 1rem; }
+    @media (max-width: 520px) {
+      header { flex-wrap: wrap; }
+      .header-actions { flex-wrap: wrap; justify-content: flex-end; }
+      .pronunciation-count-badge { font-size: 0.75rem; padding: 6px 8px; }
     }
 
     .icon-btn {
@@ -264,6 +288,16 @@
       line-height: 1.1;
       word-break: break-word;
       user-select: text;
+    }
+
+    .front-word-meaning {
+      margin: 8px auto 18px;
+      max-width: 90%;
+      color: var(--text-secondary, #64748b);
+      font-size: clamp(1rem, 2.5vw, 1.25rem);
+      font-weight: 600;
+      line-height: 1.5;
+      text-align: center;
     }
 
     .front-audio-actions {
@@ -1272,6 +1306,7 @@
       </div>
     </div>
     <div class="header-actions">
+      <div class="pronunciation-count-badge" title="發音評分達 80 分以上的累計次數">🏆 80分以上：<b id="pronunciationSuccessCount">0</b> 次</div>
       <input type="file" id="csvFileInput" accept=".csv,text/csv">
       <button class="icon-btn" id="uploadBtn" title="上傳 CSV">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -1361,21 +1396,30 @@
     const DB_VERSION = 1;
     const STORE_NAME = "app_state";
 
+    // 安全 IndexedDB 開啟：在沙盒環境 (如 Google Apps Script) 中自動降級避免例外中止
     function openDB() {
       return new Promise((resolve) => {
-        if (!window.indexedDB) {
-          resolve(null);
-          return;
-        }
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = (e) => {
-          const db = e.target.result;
-          if (!db.objectStoreNames.contains(STORE_NAME)) {
-            db.createObjectStore(STORE_NAME);
+        try {
+          if (!window.indexedDB) {
+            resolve(null);
+            return;
           }
-        };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => resolve(null);
+          const req = indexedDB.open(DB_NAME, DB_VERSION);
+          req.onupgradeneeded = (e) => {
+            try {
+              const db = e.target.result;
+              if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME);
+              }
+            } catch (err) {
+              resolve(null);
+            }
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => resolve(null);
+        } catch (e) {
+          resolve(null);
+        }
       });
     }
 
@@ -1394,12 +1438,15 @@
         if (db) {
           const tx = db.transaction(STORE_NAME, "readwrite");
           tx.objectStore(STORE_NAME).put(dataToSave, "current_session");
-        } else {
+          return;
+        }
+      } catch (e) {}
+
+      try {
+        if (typeof window !== 'undefined' && 'localStorage' in window) {
           localStorage.setItem("srs_app_state", JSON.stringify(dataToSave));
         }
-      } catch (e) {
-        localStorage.setItem("srs_app_state", JSON.stringify(dataToSave));
-      }
+      } catch (e) {}
     }
 
     async function loadState() {
@@ -1407,20 +1454,31 @@
         const db = await openDB();
         if (db) {
           return new Promise((resolve) => {
-            const tx = db.transaction(STORE_NAME, "readonly");
-            const req = tx.objectStore(STORE_NAME).get("current_session");
-            req.onsuccess = () => resolve(req.result || null);
-            req.onerror = () => resolve(null);
+            try {
+              const tx = db.transaction(STORE_NAME, "readonly");
+              const req = tx.objectStore(STORE_NAME).get("current_session");
+              req.onsuccess = () => resolve(req.result || null);
+              req.onerror = () => resolve(null);
+            } catch (e) {
+              resolve(null);
+            }
           });
         }
       } catch (e) {}
 
-      const local = localStorage.getItem("srs_app_state");
-      return local ? JSON.parse(local) : null;
+      try {
+        if (typeof window !== 'undefined' && 'localStorage' in window) {
+          const local = localStorage.getItem("srs_app_state");
+          return local ? JSON.parse(local) : null;
+        }
+      } catch (e) {}
+
+      return null;
     }
 
     let toastTimer = null;
     function showToast(msg) {
+      if (!toastBox) return;
       toastBox.textContent = msg;
       toastBox.classList.add('show');
       clearTimeout(toastTimer);
@@ -1434,6 +1492,7 @@
     let activeRecognition = null;
     let cachedAudioStream = null;
     let currentEvalSlotId = null;
+    let pronunciationFinalizeTimer = null;
 
     // 嘗試在背景保持麥克風權限授權，減少同頁面多次彈窗
     async function warmUpMicPermission() {
@@ -1444,29 +1503,41 @@
           return true;
         }
       } catch (e) {
-        // 使用者拒絕或無裝置
+        // 使用者拒絕、無裝置或受沙盒限制
       }
       return false;
     }
 
     function getBestEnVoice() {
-      const voices = window.speechSynthesis.getVoices();
-      return voices.find(v => v.lang.startsWith('en-US') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Ava'))) 
-          || voices.find(v => v.lang.startsWith('en'));
+      try {
+        if (!('speechSynthesis' in window)) return null;
+        const voices = window.speechSynthesis.getVoices();
+        return voices.find(v => v.lang.startsWith('en-US') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Ava'))) 
+            || voices.find(v => v.lang.startsWith('en'));
+      } catch (e) {
+        return null;
+      }
     }
 
     function getBestZhVoice() {
-      const voices = window.speechSynthesis.getVoices();
-      return voices.find(v => (v.lang.startsWith('zh-TW') || v.lang.startsWith('zh-HK')) && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Han') || v.name.includes('Yating') || v.name.includes('Mei-Jia') || v.name.includes('HsiaoChen')))
-          || voices.find(v => v.lang.startsWith('zh-TW') || v.lang.startsWith('zh'));
+      try {
+        if (!('speechSynthesis' in window)) return null;
+        const voices = window.speechSynthesis.getVoices();
+        return voices.find(v => (v.lang.startsWith('zh-TW') || v.lang.startsWith('zh-HK')) && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Han') || v.name.includes('Yating') || v.name.includes('Mei-Jia') || v.name.includes('HsiaoChen')))
+            || voices.find(v => v.lang.startsWith('zh-TW') || v.lang.startsWith('zh'));
+      } catch (e) {
+        return null;
+      }
     }
 
     if ('speechSynthesis' in window) {
-      window.speechSynthesis.onvoiceschanged = () => {
-        if (window.speechSynthesis.getVoices) {
-          window.speechSynthesis.getVoices();
-        }
-      };
+      try {
+        window.speechSynthesis.onvoiceschanged = () => {
+          if (window.speechSynthesis.getVoices) {
+            window.speechSynthesis.getVoices();
+          }
+        };
+      } catch (e) {}
     }
 
     // 終止當前正在進行的語音辨識與重設所有錄音按鈕視覺
@@ -1475,198 +1546,253 @@
         try { activeRecognition.abort(); } catch (e) {}
         activeRecognition = null;
       }
-      document.querySelectorAll('.recording').forEach(el => el.classList.remove('recording'));
-      const micBtnText = document.getElementById('micBtnText');
-      if (micBtnText) micBtnText.textContent = "發音評分";
+      try {
+        document.querySelectorAll('.recording').forEach(el => el.classList.remove('recording'));
+        const micBtnText = document.getElementById('micBtnText');
+        if (micBtnText) micBtnText.textContent = "發音評分";
+      } catch (e) {}
     }
 
     // 單純播放特定英文文字 (例如背面單字純發音)
     function speak(text, rate = 0.92) {
-      if (!('speechSynthesis' in window)) return;
-      if (!text || !text.trim()) return;
+      try {
+        if (!('speechSynthesis' in window)) return;
+        if (!text || !text.trim()) return;
 
-      abortActiveRecognition();
-      speechSessionId++;
-      window.speechSynthesis.cancel();
+        abortActiveRecognition();
+        speechSessionId++;
+        window.speechSynthesis.cancel();
 
-      const utterance = new SpeechSynthesisUtterance(text.trim());
-      utterance.lang = 'en-US';
-      utterance.rate = rate;
+        const utterance = new SpeechSynthesisUtterance(text.trim());
+        utterance.lang = 'en-US';
+        utterance.rate = rate;
 
-      const bestVoice = getBestEnVoice();
-      if (bestVoice) utterance.voice = bestVoice;
+        const bestVoice = getBestEnVoice();
+        if (bestVoice) utterance.voice = bestVoice;
 
-      window.speechSynthesis.speak(utterance);
+        window.speechSynthesis.speak(utterance);
+      } catch (e) {
+        console.warn("TTS error:", e);
+      }
     }
 
-    // 正面專屬朗讀邏輯：先唸單字 -> 拼讀每一個字母音 (語速 1.15) -> 再唸單字一次
-    function speakWordWithSpelling(word) {
-      if (!('speechSynthesis' in window)) return;
-      if (!word || !word.trim()) return;
+    // 從卡片內容擷取主單字的中文意思（優先讀取「詞性變化」區段）
+    function getChineseMeaning(word, content) {
+      if (!word || !content) return '';
+      const lines = content.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      const wordEscaped = word.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const matchLine = lines.find(line => {
+        if (/^【/.test(line)) return false;
+        return new RegExp('^' + wordEscaped + '\\s*(?:\\([^)]+\\))?\\s*[:：-]?\\s*').test(line);
+      });
+      if (matchLine) {
+        const meaning = matchLine.replace(new RegExp('^' + wordEscaped + '\\s*(?:\\([^)]+\\))?\\s*[:：-]?\\s*'), '').trim();
+        if (meaning && /[\u4e00-\u9fff]/.test(meaning)) return meaning;
+      }
+      // 若詞性行格式不同，退而擷取第一個含中文、且位於內容前段的詞性解釋
+      const firstSection = content.split('【搭配詞】')[0].split('【例句】')[0];
+      const fallback = firstSection.split(/\r?\n/).map(line => line.trim()).find(line => line && !line.startsWith('【') && /[\u4e00-\u9fff]/.test(line));
+      return fallback ? fallback.replace(/^\S+\s*/, '').replace(/^\([^)]*\)\s*/, '').trim() || fallback : '';
+    }
 
-      abortActiveRecognition();
-      const cleanWord = word.trim();
-      const currentSession = ++speechSessionId;
-      window.speechSynthesis.cancel();
-
-      const bestVoice = getBestEnVoice();
-
-      // 1. 第一次朗讀單字
-      const u1 = new SpeechSynthesisUtterance(cleanWord);
-      u1.lang = 'en-US';
-      u1.rate = 0.92;
-      if (bestVoice) u1.voice = bestVoice;
-
-      // 2. 拼讀每一個字母音 (語速 1.15，輕快俐落)
-      const letterSequence = cleanWord
-        .split('')
-        .filter(c => /[A-Za-z]/.test(c))
-        .map(c => c.toUpperCase())
-        .join(', ');
-
-      const u2 = new SpeechSynthesisUtterance(letterSequence);
-      u2.lang = 'en-US';
-      u2.rate = 1.15;
-      if (bestVoice) u2.voice = bestVoice;
-
-      // 3. 第二次朗讀單字
-      const u3 = new SpeechSynthesisUtterance(cleanWord);
-      u3.lang = 'en-US';
-      u3.rate = 0.95;
-      if (bestVoice) u3.voice = bestVoice;
-
-      // 串接事件
-      u1.onend = () => {
-        if (currentSession === speechSessionId) {
-          window.speechSynthesis.speak(u2);
+    // 正面專屬朗讀：單字 -> 字母拼讀 -> 再唸單字 -> 中文意思
+    function speakWordWithSpelling(word, meaning = '') {
+      try {
+        if (!('speechSynthesis' in window)) return;
+        if (!word || !word.trim()) return;
+        if (!meaning && state && Array.isArray(state.cards)) {
+          const matchedCard = state.cards.find(card => card && card.word === word.trim());
+          if (matchedCard) meaning = getChineseMeaning(matchedCard.word, matchedCard.content || '');
         }
-      };
 
-      u2.onend = () => {
-        if (currentSession === speechSessionId) {
-          window.speechSynthesis.speak(u3);
+        abortActiveRecognition();
+        const cleanWord = word.trim();
+        const currentSession = ++speechSessionId;
+        window.speechSynthesis.cancel();
+
+        const bestVoice = getBestEnVoice();
+
+        // 1. 第一次朗讀單字
+        const u1 = new SpeechSynthesisUtterance(cleanWord);
+        u1.lang = 'en-US';
+        u1.rate = 0.92;
+        if (bestVoice) u1.voice = bestVoice;
+
+        // 2. 拼讀每一個字母音 (語速 1.15，輕快俐落)
+        const letterSequence = cleanWord
+          .split('')
+          .filter(c => /[A-Za-z]/.test(c))
+          .map(c => c.toUpperCase())
+          .join(', ');
+
+        const u2 = new SpeechSynthesisUtterance(letterSequence);
+        u2.lang = 'en-US';
+        u2.rate = 1.15;
+        if (bestVoice) u2.voice = bestVoice;
+
+        // 3. 第二次朗讀完整單字
+        const u3 = new SpeechSynthesisUtterance(cleanWord);
+        u3.lang = 'en-US';
+        u3.rate = 0.95;
+        if (bestVoice) u3.voice = bestVoice;
+
+        // 4. 英文完整單字唸完後，再以繁體中文唸出意思
+        const u4 = meaning && meaning.trim() ? new SpeechSynthesisUtterance(meaning.trim()) : null;
+        if (u4) {
+          u4.lang = 'zh-TW';
+          u4.rate = 0.92;
+          const zhVoice = getBestZhVoice();
+          if (zhVoice) u4.voice = zhVoice;
         }
-      };
 
-      window.speechSynthesis.speak(u1);
+        // 串接事件
+        u1.onend = () => {
+          if (currentSession === speechSessionId) {
+            window.speechSynthesis.speak(u2);
+          }
+        };
+
+        u2.onend = () => {
+          if (currentSession === speechSessionId) window.speechSynthesis.speak(u3);
+        };
+        u3.onend = () => {
+          if (currentSession === speechSessionId && u4) window.speechSynthesis.speak(u4);
+        };
+
+        window.speechSynthesis.speak(u1);
+      } catch (e) {
+        console.warn("TTS spelling error:", e);
+      }
     }
 
     // 例句專屬朗讀：
     // - 0.75x：英文例句朗讀完畢後，接續朗讀中文解釋
     // - 0.5x 慢速：僅朗讀英文例句，不朗讀中文
     function speakExample(enText, zhText, rate = 0.75, includeZh = true) {
-      if (!('speechSynthesis' in window)) return;
-      if (!enText || !enText.trim()) return;
+      try {
+        if (!('speechSynthesis' in window)) return;
+        if (!enText || !enText.trim()) return;
 
-      abortActiveRecognition();
-      const currentSession = ++speechSessionId;
-      window.speechSynthesis.cancel();
+        abortActiveRecognition();
+        const currentSession = ++speechSessionId;
+        window.speechSynthesis.cancel();
 
-      // 1. 朗讀英文例句
-      const u1 = new SpeechSynthesisUtterance(enText.trim());
-      u1.lang = 'en-US';
-      u1.rate = rate;
-      const enVoice = getBestEnVoice();
-      if (enVoice) u1.voice = enVoice;
+        // 1. 朗讀英文例句
+        const u1 = new SpeechSynthesisUtterance(enText.trim());
+        u1.lang = 'en-US';
+        u1.rate = rate;
+        const enVoice = getBestEnVoice();
+        if (enVoice) u1.voice = enVoice;
 
-      // 2. 若為 0.75x 且有中文解釋，英文結束後接續朗讀中文
-      const cleanZh = (zhText || '').replace(/^[（(]\s*/, '').replace(/\s*[)）]$/, '').trim();
-      if (includeZh && cleanZh) {
-        const u2 = new SpeechSynthesisUtterance(cleanZh);
-        u2.lang = 'zh-TW';
-        u2.rate = 0.95;
-        const zhVoice = getBestZhVoice();
-        if (zhVoice) u2.voice = zhVoice;
+        // 2. 若為 0.75x 且有中文解釋，英文結束後接續朗讀中文
+        const cleanZh = (zhText || '').replace(/^[（(]\s*/, '').replace(/\s*[)）]$/, '').trim();
+        if (includeZh && cleanZh) {
+          const u2 = new SpeechSynthesisUtterance(cleanZh);
+          u2.lang = 'zh-TW';
+          u2.rate = 0.95;
+          const zhVoice = getBestZhVoice();
+          if (zhVoice) u2.voice = zhVoice;
 
-        u1.onend = () => {
-          if (currentSession === speechSessionId) {
-            window.speechSynthesis.speak(u2);
-          }
-        };
+          u1.onend = () => {
+            if (currentSession === speechSessionId) {
+              window.speechSynthesis.speak(u2);
+            }
+          };
+        }
+
+        window.speechSynthesis.speak(u1);
+      } catch (e) {
+        console.warn("TTS example error:", e);
       }
-
-      window.speechSynthesis.speak(u1);
     }
 
     // 詞性變化專屬朗讀：先用 en-US 唸英文單字，再用中文 zh-TW 唸出詞性與中文解釋
     function speakWordForm(enWord, zhPos, zhDef) {
-      if (!('speechSynthesis' in window)) return;
-      if (!enWord || !enWord.trim()) return;
+      try {
+        if (!('speechSynthesis' in window)) return;
+        if (!enWord || !enWord.trim()) return;
 
-      abortActiveRecognition();
-      const currentSession = ++speechSessionId;
-      window.speechSynthesis.cancel();
+        abortActiveRecognition();
+        const currentSession = ++speechSessionId;
+        window.speechSynthesis.cancel();
 
-      // 1. 英文單字發音
-      const u1 = new SpeechSynthesisUtterance(enWord.trim());
-      u1.lang = 'en-US';
-      u1.rate = 0.92;
-      const enVoice = getBestEnVoice();
-      if (enVoice) u1.voice = enVoice;
+        // 1. 英文單字發音
+        const u1 = new SpeechSynthesisUtterance(enWord.trim());
+        u1.lang = 'en-US';
+        u1.rate = 0.92;
+        const enVoice = getBestEnVoice();
+        if (enVoice) u1.voice = enVoice;
 
-      // 2. 中文詞性與中文解釋組合
-      let zhText = '';
-      const p = (zhPos || '').trim();
-      const d = (zhDef || '').trim();
+        // 2. 中文詞性與中文解釋組合
+        let zhText = '';
+        const p = (zhPos || '').trim();
+        const d = (zhDef || '').trim();
 
-      if (p && d) {
-        zhText = `${p}，${d}`;
-      } else if (p) {
-        zhText = p;
-      } else if (d) {
-        zhText = d;
+        if (p && d) {
+          zhText = `${p}，${d}`;
+        } else if (p) {
+          zhText = p;
+        } else if (d) {
+          zhText = d;
+        }
+
+        if (zhText) {
+          const u2 = new SpeechSynthesisUtterance(zhText);
+          u2.lang = 'zh-TW';
+          u2.rate = 0.95;
+          const zhVoice = getBestZhVoice();
+          if (zhVoice) u2.voice = zhVoice;
+
+          u1.onend = () => {
+            if (currentSession === speechSessionId) {
+              window.speechSynthesis.speak(u2);
+            }
+          };
+        }
+
+        window.speechSynthesis.speak(u1);
+      } catch (e) {
+        console.warn("TTS wordform error:", e);
       }
-
-      if (zhText) {
-        const u2 = new SpeechSynthesisUtterance(zhText);
-        u2.lang = 'zh-TW';
-        u2.rate = 0.95;
-        const zhVoice = getBestZhVoice();
-        if (zhVoice) u2.voice = zhVoice;
-
-        u1.onend = () => {
-          if (currentSession === speechSessionId) {
-            window.speechSynthesis.speak(u2);
-          }
-        };
-      }
-
-      window.speechSynthesis.speak(u1);
     }
 
     // 搭配詞專屬朗讀：先用 en-US 唸英文搭配詞片語，再用中文 zh-TW 唸出中文解釋
     function speakCollocation(enPart, zhPart) {
-      if (!('speechSynthesis' in window)) return;
-      if (!enPart || !enPart.trim()) return;
+      try {
+        if (!('speechSynthesis' in window)) return;
+        if (!enPart || !enPart.trim()) return;
 
-      abortActiveRecognition();
-      const currentSession = ++speechSessionId;
-      window.speechSynthesis.cancel();
+        abortActiveRecognition();
+        const currentSession = ++speechSessionId;
+        window.speechSynthesis.cancel();
 
-      // 1. 英文搭配詞片語
-      const u1 = new SpeechSynthesisUtterance(enPart.trim());
-      u1.lang = 'en-US';
-      u1.rate = 0.9;
-      const enVoice = getBestEnVoice();
-      if (enVoice) u1.voice = enVoice;
+        // 1. 英文搭配詞片語
+        const u1 = new SpeechSynthesisUtterance(enPart.trim());
+        u1.lang = 'en-US';
+        u1.rate = 0.9;
+        const enVoice = getBestEnVoice();
+        if (enVoice) u1.voice = enVoice;
 
-      // 2. 中文翻譯解釋
-      const cleanZh = (zhPart || '').trim();
-      if (cleanZh) {
-        const u2 = new SpeechSynthesisUtterance(cleanZh);
-        u2.lang = 'zh-TW';
-        u2.rate = 0.95;
-        const zhVoice = getBestZhVoice();
-        if (zhVoice) u2.voice = zhVoice;
+        // 2. 中文翻譯解釋
+        const cleanZh = (zhPart || '').trim();
+        if (cleanZh) {
+          const u2 = new SpeechSynthesisUtterance(cleanZh);
+          u2.lang = 'zh-TW';
+          u2.rate = 0.95;
+          const zhVoice = getBestZhVoice();
+          if (zhVoice) u2.voice = zhVoice;
 
-        u1.onend = () => {
-          if (currentSession === speechSessionId) {
-            window.speechSynthesis.speak(u2);
-          }
-        };
+          u1.onend = () => {
+            if (currentSession === speechSessionId) {
+              window.speechSynthesis.speak(u2);
+            }
+          };
+        }
+
+        window.speechSynthesis.speak(u1);
+      } catch (e) {
+        console.warn("TTS collocation error:", e);
       }
-
-      window.speechSynthesis.speak(u1);
     }
 
     // ==========================================
@@ -1799,13 +1925,21 @@
     async function startPronunciationTest(targetText, label = '單字', triggerBtn = null, slotId = null) {
       const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (!SpeechRec) {
-        alert("您的瀏覽器暫不支援語音辨識 API（SpeechRecognition）。請使用 Google Chrome 或 Microsoft Edge 瀏覽器以使用發音評分功能！");
+        alert("您的瀏覽器暫不支援語音辨識 API（SpeechRecognition）。請使用 Google Chrome 或 Microsoft Edge 瀏覽器以使用發音評分功能！\n(若在雲端硬碟/GAS iframe 內執行，瀏覽器安全規範可能限制麥克風功能)");
         return;
       }
 
       // 正在發音則取消 TTS
       speechSessionId++;
-      if (window.speechSynthesis) window.speechSynthesis.cancel();
+      try {
+        if (window.speechSynthesis) window.speechSynthesis.cancel();
+      } catch (e) {}
+
+      // 清除上一輪的延遲評分計時器
+      if (pronunciationFinalizeTimer) {
+        clearTimeout(pronunciationFinalizeTimer);
+        pronunciationFinalizeTimer = null;
+      }
 
       // 若已有辨識在進行，先停止
       if (activeRecognition) {
@@ -1817,7 +1951,9 @@
       closeEvalResult();
       currentEvalSlotId = slotId;
 
-      // iPhone/iOS 上避免先用 getUserMedia 開啟另一個音訊串流，可能與 SpeechRecognition 衝突。
+      // 暖機麥克風權限以減少後續彈窗
+      warmUpMicPermission();
+
       // 定位當前評測目標下方的專屬插槽容器
       const resultBox = slotId 
         ? document.getElementById(slotId) 
@@ -1845,44 +1981,71 @@
         `;
       }
 
-      const recognition = new SpeechRec();
+      let recognition = null;
+      try {
+        recognition = new SpeechRec();
+      } catch (err) {
+        document.querySelectorAll('.recording').forEach(el => el.classList.remove('recording'));
+        if (micBtnText && !state.isFlipped) micBtnText.textContent = "發音評分";
+        showToast("此環境無法初始化語音辨識（可能受 iframe 沙盒限制）");
+        return;
+      }
+
       activeRecognition = recognition;
       recognition.lang = 'en-US';
       recognition.continuous = false;
-      recognition.interimResults = false;
+      recognition.interimResults = true;
       recognition.maxAlternatives = 5;
 
       let hasResult = false;
-      let hasError = false;
-      let timedOut = false;
-      let recognitionTimer = null;
+      let hasScored = false;
+      let latestCandidates = [];
+
+      // 偵測到語音後，每次辨識結果都重新計時；停止說話約 2 秒便顯示評分。
+      const finalizePronunciationScore = () => {
+        if (hasScored || latestCandidates.length === 0) return;
+        hasScored = true;
+        hasResult = true;
+        if (pronunciationFinalizeTimer) {
+          clearTimeout(pronunciationFinalizeTimer);
+          pronunciationFinalizeTimer = null;
+        }
+        const evalResult = calculatePronunciationScore(targetText, latestCandidates);
+        if (evalResult.score >= 80) recordPronunciationSuccess();
+        renderPronunciationResult(evalResult, targetText, label, slotId);
+        speakPronunciationFeedback(evalResult.score);
+        try { recognition.stop(); } catch (e) {}
+      };
 
       recognition.onresult = (event) => {
-        hasResult = true;
-        if (recognitionTimer) clearTimeout(recognitionTimer);
         const candidates = [];
-        if (event.results && event.results[0]) {
-          for (let i = 0; i < event.results[0].length; i++) {
-            candidates.push({
-              transcript: event.results[0][i].transcript,
-              confidence: event.results[0][i].confidence
-            });
+        if (event.results) {
+          // 使用最新一段辨識結果，保留多個候選辨識供評分演算法比較。
+          const lastIndex = event.results.length - 1;
+          const result = event.results[lastIndex];
+          if (result) {
+            for (let i = 0; i < result.length; i++) {
+              candidates.push({
+                transcript: result[i].transcript,
+                confidence: result[i].confidence
+              });
+            }
           }
         }
-
-        const evalResult = calculatePronunciationScore(targetText, candidates);
-        renderPronunciationResult(evalResult, targetText, label, slotId);
+        if (candidates.length && candidates.some(c => c.transcript && c.transcript.trim())) {
+          latestCandidates = candidates;
+          if (pronunciationFinalizeTimer) clearTimeout(pronunciationFinalizeTimer);
+          pronunciationFinalizeTimer = setTimeout(finalizePronunciationScore, 1000);
+        }
       };
 
       recognition.onerror = (event) => {
-        hasError = true;
-        if (recognitionTimer) clearTimeout(recognitionTimer);
         document.querySelectorAll('.recording').forEach(el => el.classList.remove('recording'));
         if (micBtnText && !state.isFlipped) micBtnText.textContent = "發音評分";
 
         let errMsg = "未捕捉到清晰語音，請靠近麥克風再試一次";
         if (event.error === 'not-allowed' || event.error === 'permission-denied') {
-          errMsg = "瀏覽器未允許麥克風權限！若直接點檔案開啟 (file://)，Chrome 每次都會詢問。推薦點擊「啟動單字卡(永久記憶麥克風).bat」即可「永遠記住權限」！";
+          errMsg = "瀏覽器未允許麥克風權限！注意：若在 Google 雲端硬碟/GAS iframe 內執行，瀏覽器跨域沙盒可能直接封鎖麥克風。建議在本地或 localhost 模式開啟發音評分！";
         } else if (event.error === 'no-speech') {
           errMsg = "未偵測到聲音，請靠近麥克風並清楚唸出！";
         } else if (event.error === 'network') {
@@ -1908,43 +2071,66 @@
       };
 
       recognition.onend = () => {
-        if (recognitionTimer) clearTimeout(recognitionTimer);
+        // 若已取得語音，保留 1 秒靜音計時器；若完全沒有結果才清除計時器。
+        if (!latestCandidates.length && pronunciationFinalizeTimer) {
+          clearTimeout(pronunciationFinalizeTimer);
+          pronunciationFinalizeTimer = null;
+        }
         document.querySelectorAll('.recording').forEach(el => el.classList.remove('recording'));
         if (micBtnText && !state.isFlipped) micBtnText.textContent = "發音評分";
         activeRecognition = null;
-        // 某些 iPhone 瀏覽器會結束辨識卻不回傳 onresult，避免畫面永遠停留在「正在聆聽」。
-        if (!hasResult && !hasError && resultBox) {
-          resultBox.style.display = 'flex';
-          const msg = timedOut
-            ? '辨識等待逾時，請再按一次發音評分；若持續發生，請改用 iPhone 的 Safari 或電腦版 Chrome 測試。'
-            : '瀏覽器已結束聆聽，但沒有回傳辨識文字。請再試一次，並確認網路連線；若持續發生，請改用 iPhone 的 Safari 或電腦版 Chrome 測試。';
-          resultBox.innerHTML = `
-            <div class="eval-card eval-poor" onclick="event.stopPropagation()">
-              <button class="eval-close-btn" onclick="event.stopPropagation(); closeEvalResult('${slotId || ''}')" title="關閉">&times;</button>
-              <div class="eval-score-ring"><span class="eval-score">!</span></div>
-              <div class="eval-info">
-                <span class="eval-target-badge">${escapeHTML(label)} 評測提示</span>
-                <div class="eval-verdict">未取得辨識結果</div>
-                <div class="eval-msg">${escapeHTML(msg)}</div>
-              </div>
-            </div>`;
-        }
       };
 
       try {
         recognition.start();
-        // 12 秒仍沒有任何辨識結果時，主動結束，避免介面一直顯示「正在聆聽」。
-        recognitionTimer = setTimeout(() => {
-          if (!hasResult && !hasError) {
-            timedOut = true;
-            try { recognition.abort(); } catch (e) {}
-          }
-        }, 12000);
       } catch (err) {
-        if (recognitionTimer) clearTimeout(recognitionTimer);
         document.querySelectorAll('.recording').forEach(el => el.classList.remove('recording'));
         if (micBtnText && !state.isFlipped) micBtnText.textContent = "發音評分";
-        showToast("無法啟動麥克風，請重試");
+        showToast("無法啟動麥克風（可能受 iframe 沙盒限制）");
+      }
+    }
+
+    // 統計所有發音評分中，分數達 80 分以上的次數，並保存於此瀏覽器。
+    const PRONUNCIATION_SUCCESS_COUNT_KEY = 'srs_pronunciation_success_count_v1';
+    function getPronunciationSuccessCount() {
+      try {
+        const value = Number(localStorage.getItem(PRONUNCIATION_SUCCESS_COUNT_KEY) || 0);
+        return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+      } catch (e) { return 0; }
+    }
+    function updatePronunciationSuccessCountDisplay() {
+      const el = document.getElementById('pronunciationSuccessCount');
+      if (el) el.textContent = String(getPronunciationSuccessCount());
+    }
+    function recordPronunciationSuccess() {
+      const nextCount = getPronunciationSuccessCount() + 1;
+      try { localStorage.setItem(PRONUNCIATION_SUCCESS_COUNT_KEY, String(nextCount)); } catch (e) {}
+      updatePronunciationSuccessCountDisplay();
+    }
+    document.addEventListener('DOMContentLoaded', updatePronunciationSuccessCountDisplay);
+    updatePronunciationSuccessCountDisplay();
+
+    // 用有趣的繁體中文語音回饋發音表現
+    function speakPronunciationFeedback(score) {
+      try {
+        if (!('speechSynthesis' in window)) return;
+        const feedback = score >= 90
+          ? { text: '太神啦！', rate: 1.08, pitch: 1.22 }
+          : score >= 80
+            ? { text: '很棒喔！', rate: 1.04, pitch: 1.15 }
+            : score >= 60
+              ? { text: '再加油！', rate: 0.98, pitch: 1.05 }
+              : { text: '再試試！', rate: 0.96, pitch: 0.98 };
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(feedback.text);
+        utterance.lang = 'zh-TW';
+        utterance.rate = feedback.rate;
+        utterance.pitch = feedback.pitch;
+        const zhVoice = getBestZhVoice();
+        if (zhVoice) utterance.voice = zhVoice;
+        window.speechSynthesis.speak(utterance);
+      } catch (e) {
+        console.warn('Pronunciation feedback TTS error:', e);
       }
     }
 
@@ -2169,14 +2355,14 @@
     function updateProgress() {
       const remaining = state.queue.length;
       const mastered = state.stats.easy;
-      remainingCountEl.textContent = remaining;
-      masteredCountEl.textContent = mastered;
+      if (remainingCountEl) remainingCountEl.textContent = remaining;
+      if (masteredCountEl) masteredCountEl.textContent = mastered;
 
       const total = state.totalCount || (remaining + mastered) || 1;
       const percent = Math.min(100, Math.round((mastered / total) * 100));
-      progressPercentEl.textContent = `${percent}%`;
-      progressFillEl.style.width = `${percent}%`;
-      filePillEl.textContent = state.fileName;
+      if (progressPercentEl) progressPercentEl.textContent = `${percent}%`;
+      if (progressFillEl) progressFillEl.style.width = `${percent}%`;
+      if (filePillEl) filePillEl.textContent = state.fileName;
     }
 
     function renderCard() {
@@ -2189,45 +2375,50 @@
       }
 
       const cardIndex = state.queue[0];
-      const card = state.cards[cardIndex];
-      const currentWord = card.word;
-      const currentContent = card.content;
+      const card = state.cards[cardIndex] || DEFAULT_CARDS[0];
+      const currentWord = card.word || "Word";
+      const currentContent = card.content || "";
 
       if (!state.isFlipped) {
         // --- 正面：雙按鈕（範例發音 ＆ 練習者發音評分） + 評分顯示面板在下方 ---
-        cardStage.innerHTML = `
-          <div class="flashcard" onclick="flipCard()">
-            <div class="card-front">
-              <span class="word-badge">TOEIC Vocabulary</span>
-              <h1 class="word-title">${escapeHTML(currentWord)}</h1>
-              
-              <div class="front-audio-actions">
-                <button class="audio-btn" onclick="event.stopPropagation(); speakWordWithSpelling('${escapeJS(currentWord)}')" title="聆聽單字拼讀範例發音 (Enter)">
-                  <svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-                  <span>範例發音</span>
-                </button>
-                <button class="mic-btn" id="micBtn" onclick="event.stopPropagation(); startPronunciationTest('${escapeJS(currentWord)}', '正面單字', this, 'pronunciationResult')" title="點擊錄音並評估您的發音是否正確">
-                  <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-                  <span id="micBtnText">發音評分</span>
-                </button>
-              </div>
+        if (cardStage) {
+          cardStage.innerHTML = `
+            <div class="flashcard" onclick="flipCard()">
+              <div class="card-front">
+                <span class="word-badge">TOEIC Vocabulary</span>
+                <h1 class="word-title">${escapeHTML(currentWord)}</h1>
+                <div class="front-word-meaning">${escapeHTML(getChineseMeaning(currentWord, currentContent) || '（此單字尚未提供中文意思）')}</div>
+                
+                <div class="front-audio-actions">
+                  <button class="audio-btn" onclick="event.stopPropagation(); speakWordWithSpelling('${escapeJS(currentWord)}', '${escapeJS(getChineseMeaning(currentWord, currentContent))}')" title="聆聽單字拼讀範例發音 (Enter)">
+                    <svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+                    <span>範例發音</span>
+                  </button>
+                  <button class="mic-btn" id="micBtn" onclick="event.stopPropagation(); startPronunciationTest('${escapeJS(currentWord)}', '正面單字', this, 'pronunciationResult')" title="點擊錄音並評估您的發音是否正確">
+                    <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                    <span id="micBtnText">發音評分</span>
+                  </button>
+                </div>
 
-              <!-- 正面單字下方專屬評測容器 -->
-              <div class="eval-box-container" id="pronunciationResult"></div>
+                <!-- 正面單字下方專屬評測容器 -->
+                <div class="eval-box-container" id="pronunciationResult"></div>
 
-              <div class="front-hint">
-                <span>按</span> <span class="kbd">Space</span> <span>或點擊卡片翻面</span>
+                <div class="front-hint">
+                  <span>按</span> <span class="kbd">Space</span> <span>或點擊卡片翻面</span>
+                </div>
               </div>
             </div>
-          </div>
-        `;
+          `;
+        }
 
-        controlsPanel.innerHTML = `
-          <button class="flip-btn" onclick="flipCard()">
-            <span>顯示答案 / 翻至背面</span>
-            <span class="kbd" style="background:rgba(255,255,255,0.25); border:none; color:white;">Space</span>
-          </button>
-        `;
+        if (controlsPanel) {
+          controlsPanel.innerHTML = `
+            <button class="flip-btn" onclick="flipCard()">
+              <span>顯示答案 / 翻至背面</span>
+              <span class="kbd" style="background:rgba(255,255,255,0.25); border:none; color:white;">Space</span>
+            </button>
+          `;
+        }
 
       } else {
         // --- 背面 ---
@@ -2363,75 +2554,79 @@
           }
         });
 
-        cardStage.innerHTML = `
-          <div class="flashcard" onclick="flipCard()">
-            <div class="card-back">
-              <div class="back-header-wrapper">
-                <div class="back-header">
-                  <div class="back-word-group">
-                    <h2 class="back-word">${escapeHTML(currentWord)}</h2>
-                    <div class="back-word-actions">
-                      <button class="btn-pill-action" onclick="event.stopPropagation(); speak('${escapeJS(currentWord)}', 0.95)" title="聆聽單字發音">
-                        <svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-                        <span>範例發音</span>
-                      </button>
-                      <button class="btn-pill-action mic-type" onclick="event.stopPropagation(); startPronunciationTest('${escapeJS(currentWord)}', '單字', this, 'header-eval-slot')" title="評測單字發音">
-                        <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-                        <span>發音評分</span>
-                      </button>
+        if (cardStage) {
+          cardStage.innerHTML = `
+            <div class="flashcard" onclick="flipCard()">
+              <div class="card-back">
+                <div class="back-header-wrapper">
+                  <div class="back-header">
+                    <div class="back-word-group">
+                      <h2 class="back-word">${escapeHTML(currentWord)}</h2>
+                      <div class="back-word-actions">
+                        <button class="btn-pill-action" onclick="event.stopPropagation(); speak('${escapeJS(currentWord)}', 0.95)" title="聆聽單字發音">
+                          <svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+                          <span>範例發音</span>
+                        </button>
+                        <button class="btn-pill-action mic-type" onclick="event.stopPropagation(); startPronunciationTest('${escapeJS(currentWord)}', '單字', this, 'header-eval-slot')" title="評測單字發音">
+                          <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                          <span>發音評分</span>
+                        </button>
+                      </div>
+                    </div>
+                    <div class="front-hint">
+                      <span class="kbd">Space</span> <span>翻回正面</span>
                     </div>
                   </div>
-                  <div class="front-hint">
-                    <span class="kbd">Space</span> <span>翻回正面</span>
-                  </div>
+                  <!-- 背面主單字下方專屬評測容器 -->
+                  <div class="inline-eval-slot" id="header-eval-slot"></div>
                 </div>
-                <!-- 背面主單字下方專屬評測容器 -->
-                <div class="inline-eval-slot" id="header-eval-slot"></div>
+
+                <div class="card-image-box" id="imgBox">
+                  <div class="img-skeleton"></div>
+                  <img class="card-image" id="cardImg" src="${imgUrl}" alt="${escapeHTML(currentWord)}" 
+                    onload="this.classList.add('loaded')" 
+                    onerror="handleImgError(this, '${fallbackImgUrl}')">
+                </div>
+
+                ${sectionsHTML}
               </div>
+            </div>
+          `;
+        }
 
-              <div class="card-image-box" id="imgBox">
-                <div class="img-skeleton"></div>
-                <img class="card-image" id="cardImg" src="${imgUrl}" alt="${escapeHTML(currentWord)}" 
-                  onload="this.classList.add('loaded')" 
-                  onerror="handleImgError(this, '${fallbackImgUrl}')">
+        if (controlsPanel) {
+          controlsPanel.innerHTML = `
+            <div class="back-action-bar">
+              <button class="flip-back-btn" onclick="flipCard()">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
+                <span>翻回正面</span>
+                <span class="kbd">Space</span>
+              </button>
+              <div class="srs-buttons-grid">
+                <button class="srs-btn btn-again" onclick="handleSRS(1)" title="插入第 2 個位置 (快捷鍵 1)">
+                  <span class="srs-title">Again</span>
+                  <span class="srs-sub">重來 (第2張)</span>
+                  <span class="srs-key">1</span>
+                </button>
+                <button class="srs-btn btn-hard" onclick="handleSRS(2)" title="插入隊列中間 (快捷鍵 2)">
+                  <span class="srs-title">Hard</span>
+                  <span class="srs-sub">困難 (中間)</span>
+                  <span class="srs-key">2</span>
+                </button>
+                <button class="srs-btn btn-good" onclick="handleSRS(3)" title="插入隊列尾端 (快捷鍵 3)">
+                  <span class="srs-title">Good</span>
+                  <span class="srs-sub">良好 (尾端)</span>
+                  <span class="srs-key">3</span>
+                </button>
+                <button class="srs-btn btn-easy" onclick="handleSRS(4)" title="移出隊列 (快捷鍵 4)">
+                  <span class="srs-title">Easy</span>
+                  <span class="srs-sub">掌握 (移出)</span>
+                  <span class="srs-key">4</span>
+                </button>
               </div>
-
-              ${sectionsHTML}
             </div>
-          </div>
-        `;
-
-        controlsPanel.innerHTML = `
-          <div class="back-action-bar">
-            <button class="flip-back-btn" onclick="flipCard()">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
-              <span>翻回正面</span>
-              <span class="kbd">Space</span>
-            </button>
-            <div class="srs-buttons-grid">
-              <button class="srs-btn btn-again" onclick="handleSRS(1)" title="插入第 2 個位置 (快捷鍵 1)">
-                <span class="srs-title">Again</span>
-                <span class="srs-sub">重來 (第2張)</span>
-                <span class="srs-key">1</span>
-              </button>
-              <button class="srs-btn btn-hard" onclick="handleSRS(2)" title="插入隊列中間 (快捷鍵 2)">
-                <span class="srs-title">Hard</span>
-                <span class="srs-sub">困難 (中間)</span>
-                <span class="srs-key">2</span>
-              </button>
-              <button class="srs-btn btn-good" onclick="handleSRS(3)" title="插入隊列尾端 (快捷鍵 3)">
-                <span class="srs-title">Good</span>
-                <span class="srs-sub">良好 (尾端)</span>
-                <span class="srs-key">3</span>
-              </button>
-              <button class="srs-btn btn-easy" onclick="handleSRS(4)" title="移出隊列 (快捷鍵 4)">
-                <span class="srs-title">Easy</span>
-                <span class="srs-sub">掌握 (移出)</span>
-                <span class="srs-key">4</span>
-              </button>
-            </div>
-          </div>
-        `;
+          `;
+        }
       }
 
       updateProgress();
@@ -2459,10 +2654,13 @@
       
       if (!state.isFlipped && state.queue.length > 0) {
         const curWord = state.cards[state.queue[0]].word;
-        speakWordWithSpelling(curWord);
+        const curCard = state.cards[state.queue[0]];
+        speakWordWithSpelling(curWord, getChineseMeaning(curWord, curCard ? curCard.content : ''));
       } else {
         speechSessionId++;
-        window.speechSynthesis.cancel();
+        try {
+          if (window.speechSynthesis) window.speechSynthesis.cancel();
+        } catch (e) {}
       }
     }
 
@@ -2515,38 +2713,40 @@
       abortActiveRecognition();
       closeEvalResult();
       updateProgress();
-      cardStage.innerHTML = `
-        <div class="complete-card">
-          <div class="trophy-icon">🏆</div>
-          <h2 class="complete-title">恭喜！本輪單字已全數完成！</h2>
-          <p class="complete-desc">您已透過 Spaced Repetition 系統完成了本題庫的所有單字學習與複習。</p>
-          
-          <div class="stats-summary-grid">
-            <div class="summary-item again">
-              <span class="summary-num">${state.stats.again}</span>
-              <span class="summary-label">Again 次數</span>
+      if (cardStage) {
+        cardStage.innerHTML = `
+          <div class="complete-card">
+            <div class="trophy-icon">🏆</div>
+            <h2 class="complete-title">恭喜！本輪單字已全數完成！</h2>
+            <p class="complete-desc">您已透過 Spaced Repetition 系統完成了本題庫的所有單字學習與複習。</p>
+            
+            <div class="stats-summary-grid">
+              <div class="summary-item again">
+                <span class="summary-num">${state.stats.again}</span>
+                <span class="summary-label">Again 次數</span>
+              </div>
+              <div class="summary-item hard">
+                <span class="summary-num">${state.stats.hard}</span>
+                <span class="summary-label">Hard 次數</span>
+              </div>
+              <div class="summary-item good">
+                <span class="summary-num">${state.stats.good}</span>
+                <span class="summary-label">Good 次數</span>
+              </div>
+              <div class="summary-item easy">
+                <span class="summary-num">${state.stats.easy}</span>
+                <span class="summary-label">Easy 掌握數</span>
+              </div>
             </div>
-            <div class="summary-item hard">
-              <span class="summary-num">${state.stats.hard}</span>
-              <span class="summary-label">Hard 次數</span>
-            </div>
-            <div class="summary-item good">
-              <span class="summary-num">${state.stats.good}</span>
-              <span class="summary-label">Good 次數</span>
-            </div>
-            <div class="summary-item easy">
-              <span class="summary-num">${state.stats.easy}</span>
-              <span class="summary-label">Easy 掌握數</span>
-            </div>
-          </div>
 
-          <div class="complete-actions">
-            <button class="primary-btn" onclick="restartDeck()">重新開始本組</button>
-            <button class="secondary-btn" onclick="triggerUpload()">匯入新 CSV</button>
+            <div class="complete-actions">
+              <button class="primary-btn" onclick="restartDeck()">重新開始本組</button>
+              <button class="secondary-btn" onclick="triggerUpload()">匯入新 CSV</button>
+            </div>
           </div>
-        </div>
-      `;
-      controlsPanel.innerHTML = '';
+        `;
+      }
+      if (controlsPanel) controlsPanel.innerHTML = '';
     }
 
     function restartDeck() {
@@ -2566,85 +2766,91 @@
     function triggerUpload() {
       abortActiveRecognition();
       closeEvalResult();
-      csvFileInput.value = '';
-      csvFileInput.click();
+      if (csvFileInput) {
+        csvFileInput.value = '';
+        csvFileInput.click();
+      }
     }
 
-    csvFileInput.addEventListener('change', function(e) {
-      const file = e.target.files[0];
-      if (!file) return;
+    if (csvFileInput) {
+      csvFileInput.addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
 
-      if (!file.name.toLowerCase().endsWith('.csv') && file.type !== 'text/csv') {
-        alert("防呆提示：上傳檔案格式不正確，請選取標準 .csv 檔案！");
-        return;
-      }
-
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        try {
-          const content = evt.target.result;
-          const rows = parseCSV(content);
-
-          if (!rows || rows.length === 0) {
-            alert("防呆提示：檔案內容為空，無法製作單字卡！");
-            return;
-          }
-
-          const newCards = [];
-          for (let i = 0; i < rows.length; i++) {
-            const r = rows[i];
-            const word = (r[0] || '').trim();
-            const detail = (r[1] || '').trim();
-
-            if (word) {
-              newCards.push({ word, content: detail });
-            }
-          }
-
-          if (newCards.length === 0) {
-            alert("防呆提示：未在 CSV 第 1 欄找到任何有效的單字資料！");
-            return;
-          }
-
-          state.cards = newCards;
-          state.queue = newCards.map((_, idx) => idx);
-          state.totalCount = newCards.length;
-          state.stats = { again: 0, hard: 0, good: 0, easy: 0 };
-          state.isFlipped = false;
-          state.fileName = file.name;
-
-          saveState();
-          renderCard();
-          if (state.cards.length > 0) {
-            speakWordWithSpelling(state.cards[state.queue[0]].word);
-          }
-          showToast(`成功匯入 ${newCards.length} 筆單字！`);
-
-        } catch (err) {
-          alert(`防呆提示：CSV 解析時發生錯誤：${err.message}`);
+        if (!file.name.toLowerCase().endsWith('.csv') && file.type !== 'text/csv') {
+          alert("防呆提示：上傳檔案格式不正確，請選取標準 .csv 檔案！");
+          return;
         }
-      };
 
-      reader.onerror = function() {
-        alert("防呆提示：讀取檔案時發生錯誤，請重試！");
-      };
+        const reader = new FileReader();
+        reader.onload = function(evt) {
+          try {
+            const content = evt.target.result;
+            const rows = parseCSV(content);
 
-      reader.readAsText(file, 'utf-8');
-    });
+            if (!rows || rows.length === 0) {
+              alert("防呆提示：檔案內容為空，無法製作單字卡！");
+              return;
+            }
 
-    uploadBtn.addEventListener('click', triggerUpload);
+            const newCards = [];
+            for (let i = 0; i < rows.length; i++) {
+              const r = rows[i];
+              const word = (r[0] || '').trim();
+              const detail = (r[1] || '').trim();
+
+              if (word) {
+                newCards.push({ word, content: detail });
+              }
+            }
+
+            if (newCards.length === 0) {
+              alert("防呆提示：未在 CSV 第 1 欄找到任何有效的單字資料！");
+              return;
+            }
+
+            state.cards = newCards;
+            state.queue = newCards.map((_, idx) => idx);
+            state.totalCount = newCards.length;
+            state.stats = { again: 0, hard: 0, good: 0, easy: 0 };
+            state.isFlipped = false;
+            state.fileName = file.name;
+
+            saveState();
+            renderCard();
+            if (state.cards.length > 0) {
+              speakWordWithSpelling(state.cards[state.queue[0]].word);
+            }
+            showToast(`成功匯入 ${newCards.length} 筆單字！`);
+
+          } catch (err) {
+            alert(`防呆提示：CSV 解析時發生錯誤：${err.message}`);
+          }
+        };
+
+        reader.onerror = function() {
+          alert("防呆提示：讀取檔案時發生錯誤，請重試！");
+        };
+
+        reader.readAsText(file, 'utf-8');
+      });
+    }
+
+    if (uploadBtn) uploadBtn.addEventListener('click', triggerUpload);
 
     // 點擊任何按鈕後立即清除焦點，避免空白鍵誤觸原生點擊
     document.addEventListener('click', function(e) {
-      const btn = e.target.closest('button');
-      if (btn) {
-        btn.blur();
-      }
+      try {
+        const btn = e.target.closest('button');
+        if (btn) {
+          btn.blur();
+        }
+      } catch (err) {}
     });
 
     // 鍵盤快捷鍵：在捕獲階段優先攔截
     window.addEventListener('keydown', function(e) {
-      if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+      if (document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
 
       const isSpace = (e.code === 'Space' || e.key === ' ' || e.keyCode === 32);
       const isEnter = (e.code === 'Enter' || e.key === 'Enter' || e.keyCode === 13);
@@ -2700,15 +2906,19 @@
       }
     }, true);
 
-    themeBtn.addEventListener('click', function() {
-      state.theme = state.theme === 'light' ? 'dark' : 'light';
-      applyTheme(state.theme);
-      saveState();
-    });
+    if (themeBtn) {
+      themeBtn.addEventListener('click', function() {
+        state.theme = state.theme === 'light' ? 'dark' : 'light';
+        applyTheme(state.theme);
+        saveState();
+      });
+    }
 
     function applyTheme(theme) {
-      document.documentElement.setAttribute('data-theme', theme);
-      themeIcon.textContent = theme === 'dark' ? '☀️' : '🌙';
+      try {
+        document.documentElement.setAttribute('data-theme', theme);
+        if (themeIcon) themeIcon.textContent = theme === 'dark' ? '☀️' : '🌙';
+      } catch (e) {}
     }
 
     function escapeHTML(str) {
@@ -2732,38 +2942,63 @@
     }
 
     async function init() {
-      const saved = await loadState();
-      if (saved && saved.cards && saved.cards.length > 0) {
-        state = {
-          ...state,
-          ...saved
+      try {
+        let saved = null;
+        try {
+          saved = await loadState();
+        } catch (e) {
+          console.warn("Storage load skipped in sandbox:", e);
+        }
+
+        if (saved && saved.cards && saved.cards.length > 0) {
+          state = {
+            ...state,
+            ...saved
+          };
+        } else {
+          state.cards = DEFAULT_CARDS;
+          state.queue = DEFAULT_CARDS.map((_, i) => i);
+          state.totalCount = DEFAULT_CARDS.length;
+          state.fileName = "toeic_vocab.csv (預設)";
+        }
+
+        try {
+          applyTheme(state.theme || "light");
+        } catch (e) {}
+
+        if (state.queue.length === 0) {
+          renderCompletion();
+        } else {
+          renderCard();
+        }
+
+        // 首次使用者點擊或按鍵解鎖瀏覽器語音後自動朗讀
+        const triggerInitialSpeech = () => {
+          if (!state.isFlipped && state.queue.length > 0 && state.cards[state.queue[0]]) {
+            speakWordWithSpelling(state.cards[state.queue[0]].word);
+          }
         };
-      } else {
+        window.addEventListener('click', triggerInitialSpeech, { once: true });
+        window.addEventListener('keydown', triggerInitialSpeech, { once: true });
+
+      } catch (fatalErr) {
+        console.error("Initialization error, emergency fallback:", fatalErr);
+        // 緊急容錯保底：即使環境受限也保證卡片完整渲染
         state.cards = DEFAULT_CARDS;
         state.queue = DEFAULT_CARDS.map((_, i) => i);
         state.totalCount = DEFAULT_CARDS.length;
-        state.fileName = "toeic_vocab.csv (預設範例)";
-      }
-
-      applyTheme(state.theme || "light");
-
-      if (state.queue.length === 0) {
-        renderCompletion();
-      } else {
+        state.isFlipped = false;
         renderCard();
       }
-
-      // 首次使用者點擊或按鍵解鎖瀏覽器語音後自動朗讀
-      const triggerInitialSpeech = () => {
-        if (!state.isFlipped && state.queue.length > 0) {
-          speakWordWithSpelling(state.cards[state.queue[0]].word);
-        }
-      };
-      window.addEventListener('click', triggerInitialSpeech, { once: true });
-      window.addEventListener('keydown', triggerInitialSpeech, { once: true });
     }
 
-    window.addEventListener('DOMContentLoaded', init);
+    // 兼容量測：支援本地直接開啟與 Google Apps Script (GAS) 嵌入環境
+    // 在 GAS 中 scripts 執行時 document.readyState 常已經是 'interactive' 或 'complete'
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
   </script>
 </body>
 </html>
